@@ -36,6 +36,8 @@ import pysrt
 import soundfile as sf
 import torch
 
+# Sous Windows, certains backends audio/async imposent une policy spécifique
+# pour éviter des erreurs d'event loop avec certaines dépendances.
 if sys.platform == "win32":
     import asyncio
 
@@ -57,17 +59,21 @@ def nettoyer_texte(texte: str) -> str:
     - remplace les sauts de ligne par des espaces
     - retire les espaces superflus en début/fin
     """
+    # Retire les balises éventuelles: <i>, <b>, <font>, etc.
     texte = re.sub(r"<[^>]+>", "", texte)
+    # Les retours ligne SRT deviennent des espaces pour TTS.
     return texte.replace("\n", " ").strip()
 
 
 def srt_vers_secondes(t) -> float:
     """Convertit un timestamp pysrt.SubRipTime en secondes flottantes."""
+    # Conversion HH:MM:SS,mmm -> float secondes.
     return t.hours * 3600 + t.minutes * 60 + t.seconds + t.milliseconds / 1000.0
 
 
 def obtenir_duree_video(chemin_video: str) -> float:
     """Retourne la durée de la vidéo (en secondes) via ffprobe."""
+    # ffprobe lit les métadonnées sans décoder complètement la vidéo.
     cmd = [
         "ffprobe",
         "-v",
@@ -78,7 +84,9 @@ def obtenir_duree_video(chemin_video: str) -> float:
         "default=noprint_wrappers=1:nokey=1",
         chemin_video,
     ]
+    # check=True => lève une exception si ffprobe échoue.
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    # La sortie attendue est un nombre (ex: 123.4567).
     return float(result.stdout.strip())
 
 
@@ -94,12 +102,15 @@ def assembler_audio_avec_liste(segments: list[Segment], duree: float, tmp: str) 
     total_samples = int((duree + 5) * sample_rate)
     piste = np.zeros(total_samples, dtype=np.float32)
 
+    # On place chaque segment audio à sa position temporelle "debut".
     for seg in segments:
         fichier = seg["fichier"]
+        # Ignore les fichiers absents/corrompus/vides.
         if not os.path.exists(fichier) or os.path.getsize(fichier) < 200:
             continue
 
         try:
+            # Lecture en float32 pour éviter les conversions coûteuses.
             audio, sr = sf.read(fichier, dtype="float32")
             if sr != sample_rate:
                 # Kokoro retourne normalement 24kHz; sécurité minimale.
@@ -109,14 +120,19 @@ def assembler_audio_avec_liste(segments: list[Segment], duree: float, tmp: str) 
             if audio.ndim == 2:
                 audio = audio.mean(axis=1)
 
+            # Position de départ du segment en échantillons.
             debut_sample = int(seg["debut"] * sample_rate)
+            # Position de fin théorique.
             fin_sample = debut_sample + len(audio)
+            # Tronque si le segment dépasse la taille du buffer global.
             if fin_sample > len(piste):
                 fin_sample = len(piste)
                 audio = audio[: fin_sample - debut_sample]
 
+            # Somme additive: si segments se chevauchent, ils se mixent.
             piste[debut_sample:fin_sample] += audio
         except Exception:
+            # Un segment cassé ne doit pas stopper le traitement global.
             continue
 
     # Normaliser pour éviter saturation
@@ -137,14 +153,18 @@ def generer_segments_depuis_srt(chemin_srt: str, tmp: str) -> list[Segment]:
     Le fichier est lu en UTF-8, avec fallback latin-1 pour les SRT hérités.
     """
     try:
+        # Cas standard moderne.
         subs = pysrt.open(chemin_srt, encoding="utf-8")
     except Exception:
+        # Fallback pour anciens SRT Windows.
         subs = pysrt.open(chemin_srt, encoding="latin-1")
 
     segments: list[Segment] = []
     for i, sub in enumerate(subs):
+        # Nettoyage pour améliorer la qualité TTS.
         texte = nettoyer_texte(sub.text)
         if texte:
+            # Un fichier WAV temporaire est alloué par sous-titre.
             segments.append(
                 {
                     "texte": texte,
@@ -164,6 +184,9 @@ def main() -> None:
     2. Synthèse de chaque segment
     3. Mixage de tous les segments et mux final dans le MP4
     """
+    # -----------------------------
+    # 1) Lecture des paramètres CLI
+    # -----------------------------
     parser = argparse.ArgumentParser(description="Injecte un doublage FR Kokoro à partir d'un SRT.")
     parser.add_argument("--video", required=True, help="Chemin de la vidéo d'entrée")
     parser.add_argument("--srt", required=True, help="Chemin du fichier SRT français")
@@ -176,6 +199,7 @@ def main() -> None:
     print("  SRT Français -> Audio GPU (Kokoro TTS)")
     print("=" * 55)
 
+    # Détecte automatiquement un GPU CUDA pour accélérer Kokoro.
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         device = "cuda"
@@ -189,52 +213,71 @@ def main() -> None:
     print(f"  Sortie : {args.out}")
     print(f"  Voix   : {args.voix}")
 
+    # Vérifications d'entrée avant d'initialiser les composants coûteux.
     if not os.path.exists(args.video):
         raise FileNotFoundError(f"Vidéo introuvable: {args.video}")
     if not os.path.exists(args.srt):
         raise FileNotFoundError(f"SRT introuvable: {args.srt}")
 
+    # -----------------------------
+    # 2) Chargement du moteur TTS
+    # -----------------------------
     print("\n[0/3] Chargement du modèle Kokoro...")
     from kokoro import KPipeline
 
+    # lang_code="f" => pipeline français.
     pipeline = KPipeline(lang_code="f", device=device)
     print(f"   -> Modèle chargé sur {device.upper()}")
 
+    # Dossier temporaire auto-nettoyé en fin d'exécution.
     with tempfile.TemporaryDirectory() as tmp:
         print("\n[1/3] Lecture du SRT français...")
         segments = generer_segments_depuis_srt(args.srt, tmp)
         print(f"   -> {len(segments)} sous-titres trouvés.")
 
+        # -----------------------------
+        # 3) Synthèse segment par segment
+        # -----------------------------
         print(f"\n[2/3] Génération audio (Kokoro sur {device.upper()})...")
         total = len(segments)
         echoues = 0
 
         for i, seg in enumerate(segments):
             try:
+                # Kokoro retourne un générateur de chunks audio.
                 gen = pipeline(seg["texte"], voice=args.voix, speed=args.vitesse)
                 audio_data = None
                 for _, _, audio in gen:
+                    # Concatène tous les morceaux pour ce segment.
                     audio_data = audio if audio_data is None else np.concatenate([audio_data, audio])
 
                 if audio_data is not None and len(audio_data) > 0:
+                    # Écriture WAV standard pour le mix ultérieur.
                     sf.write(seg["fichier"], audio_data, 24000)
                 else:
+                    # Segment vide -> silence de secours.
                     sf.write(seg["fichier"], np.zeros(100), 24000)
                     echoues += 1
             except Exception:
+                # Toute erreur locale devient un segment muet (pipeline robuste).
                 sf.write(seg["fichier"], np.zeros(100), 24000)
                 echoues += 1
 
+            # Affiche une progression périodique et la dernière itération.
             if total and ((i + 1) % 50 == 0 or (i + 1) == total):
                 pct = int((i + 1) / total * 100)
                 print(f"   {i + 1}/{total} ({pct}%) segments générés...")
 
         print(f"   -> {total - echoues}/{total} segments réussis.")
 
+        # -----------------------------
+        # 4) Mix global puis mux vidéo
+        # -----------------------------
         print("\n[3/3] Assemblage et intégration dans la vidéo...")
         duree = obtenir_duree_video(args.video)
         piste_wav = assembler_audio_avec_liste(segments, duree, tmp)
 
+        # ffmpeg copie la vidéo (sans réencodage) et remplace l'audio.
         cmd_video = [
             "ffmpeg",
             "-y",
@@ -252,6 +295,7 @@ def main() -> None:
             "1:a:0",
             args.out,
         ]
+        # On capture stderr pour remonter une erreur exploitable.
         r = subprocess.run(cmd_video, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"Erreur FFmpeg:\n{r.stderr[-800:]}")
